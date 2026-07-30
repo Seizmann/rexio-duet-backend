@@ -1,1 +1,6 @@
 /target
+
+# Local secrets — real values live in private-project-data.md (never committed).
+.env
+.env.*
+!.env.example
