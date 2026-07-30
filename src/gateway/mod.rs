@@ -11,12 +11,12 @@
 //! stays deliberately dumb: it checks for JWT presence and forwards, and never holds
 //! the payload key.
 
-use crate::handlers::{register_op, vent_op};
+use crate::handlers::{login_op, register_op, vent_op, OpResult};
 use crate::AppState;
 use axum::{
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -49,30 +49,25 @@ pub struct GatewayReply {
 }
 
 /// Whether an action code may be invoked without an authenticated subject.
-///
-/// Registration and login are the only unauthenticated entry points. Because the
-/// operation now lives inside an encrypted body, the proxy can no longer make this
-/// decision by inspecting the URL path — so it is made here, per code, where the
-/// plaintext op is actually known.
 fn requires_auth(op: &str) -> bool {
     !matches!(op, "a1" | "a2")
 }
 
 /// Resolves an action code to its handler.
-///
-/// Codes are intentionally terse and carry no semantic hint. The mapping is expected
-/// to migrate into DB/Redis-backed config so new operations need no redeploy; it is
-/// inlined here while the operation set is still this small.
 async fn dispatch(
     state: &Arc<AppState>,
     op: &str,
     data: Value,
     subject: Option<String>,
-) -> Result<Value, (StatusCode, String)> {
+) -> OpResult {
     match op {
         // a1 — account registration
         "a1" => register_op(state, data).await,
-        // v2 — private vent submission to the mediation orchestrator
+        // a2 — account login
+        "a2" => login_op(state, data).await,
+        // a3 — session validation / get user
+        "a3" => crate::handlers::session_op(state, subject).await,
+        // v2 — private vent submission
         "v2" => vent_op(state, data, subject).await,
         _ => Err((StatusCode::BAD_REQUEST, "unknown operation".to_string())),
     }
@@ -83,8 +78,6 @@ pub async fn gateway_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // 1. Verify the request signature over the raw bytes, before any parsing.
-    //    Rejecting unsigned traffic here keeps malformed input away from the cipher.
     let provided_sig = headers
         .get(SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -95,7 +88,6 @@ pub async fn gateway_handler(
         return opaque_error(StatusCode::UNAUTHORIZED);
     }
 
-    // 2. Decrypt the envelope. A tampered blob fails the AEAD tag check and lands here.
     let plaintext = match state.gateway_cipher.open(std::str::from_utf8(&body).unwrap_or_default()) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -109,15 +101,12 @@ pub async fn gateway_handler(
         Err(_) => return opaque_error(StatusCode::BAD_REQUEST),
     };
 
-    // Trace id: prefer the client's, fall back to the header, else synthesize one.
     let trace_id = envelope
         .trace_id
         .clone()
         .or_else(|| headers.get(TRACE_HEADER).and_then(|v| v.to_str().ok()).map(String::from))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // 3. Enforce auth per action code. The proxy only proved a token was present and
-    //    well-formed; the authoritative subject is resolved here from the JWT.
     let subject = crate::auth::subject_from_headers(&headers, &state.jwt_secret);
 
     if requires_auth(&envelope.op) && subject.is_none() {
@@ -127,7 +116,7 @@ pub async fn gateway_handler(
 
     let started = std::time::Instant::now();
     let outcome = dispatch(&state, &envelope.op, envelope.data, subject).await;
-    // Latency logging is a documented requirement for every gateway call.
+    
     tracing::info!(
         op = %envelope.op,
         trace_id = %trace_id,
@@ -136,7 +125,7 @@ pub async fn gateway_handler(
     );
 
     match outcome {
-        Ok(data) => encrypted_reply(&state, StatusCode::OK, GatewayReply { ok: true, data, trace_id }),
+        Ok((data, cookies)) => encrypted_reply(&state, StatusCode::OK, GatewayReply { ok: true, data, trace_id }, cookies),
         Err((status, message)) => {
             tracing::warn!(op = %envelope.op, trace_id = %trace_id, "Gateway operation failed: {message}");
             encrypted_reply(
@@ -147,13 +136,14 @@ pub async fn gateway_handler(
                     data: serde_json::json!({ "message": message }),
                     trace_id,
                 },
+                None
             )
         }
     }
 }
 
 /// Encrypts a reply envelope so responses are as opaque on the wire as requests.
-fn encrypted_reply(state: &Arc<AppState>, status: StatusCode, reply: GatewayReply) -> Response {
+fn encrypted_reply(state: &Arc<AppState>, status: StatusCode, reply: GatewayReply, cookies: Option<Vec<String>>) -> Response {
     let trace_id = reply.trace_id.clone();
     let json = match serde_json::to_vec(&reply) {
         Ok(bytes) => bytes,
@@ -161,15 +151,26 @@ fn encrypted_reply(state: &Arc<AppState>, status: StatusCode, reply: GatewayRepl
     };
 
     match state.gateway_cipher.seal(&json) {
-        Ok(blob) => (
-            status,
-            [
-                ("content-type", "application/octet-stream"),
-                (TRACE_HEADER, trace_id.as_str()),
-            ],
-            blob,
-        )
-            .into_response(),
+        Ok(blob) => {
+            let mut res = (
+                status,
+                [
+                    ("content-type", "application/octet-stream"),
+                    (TRACE_HEADER, trace_id.as_str()),
+                ],
+                blob,
+            )
+                .into_response();
+            
+            if let Some(cookie_list) = cookies {
+                for c in cookie_list {
+                    if let Ok(val) = HeaderValue::from_str(&c) {
+                        res.headers_mut().append(SET_COOKIE, val);
+                    }
+                }
+            }
+            res
+        },
         Err(_) => opaque_error(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
