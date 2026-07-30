@@ -4,11 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY orchestrator ./orchestrator
-COPY handlers ./handlers
-COPY models ./models
+COPY . .
 
 RUN cargo build --release
 
