@@ -36,6 +36,9 @@ pub struct AppState {
     pub vent_cipher: PayloadCipher,
     pub jwt_secret: String,
     pub gateway_signing_key: String,
+    pub supabase_url: String,
+    pub supabase_service_key: String,
+    pub http_client: reqwest::Client,
 }
 
 #[derive(Serialize)]
@@ -118,6 +121,9 @@ async fn main() {
         vent_cipher,
         jwt_secret: config.jwt_secret,
         gateway_signing_key: config.gateway_signing_key,
+        supabase_url: config.supabase_url,
+        supabase_service_key: config.supabase_service_key,
+        http_client: reqwest::Client::new(),
     });
 
     // One public operational surface: every client action flows through /api/gateway

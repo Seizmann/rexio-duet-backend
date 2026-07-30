@@ -1,73 +1,121 @@
 use crate::models::{AuthPayload, AuthResponse, VentPayload, VentResponse};
 use crate::AppState;
 use axum::http::StatusCode;
-use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
+/// Operation result: (JSON payload, optional Set-Cookie headers) on success.
+pub type OpResult = Result<(Value, Option<Vec<String>>), (StatusCode, String)>;
+
+#[derive(Deserialize)]
+struct SupabaseAuthResponse {
+    access_token: String,
+    user: SupabaseUser,
 }
 
-/// Operation result: JSON payload on success, or a status plus a client-safe message.
-type OpResult = Result<Value, (StatusCode, String)>;
+#[derive(Deserialize)]
+struct SupabaseUser {
+    id: String,
+}
 
-/// Registers a new account. Reachable without authentication by design.
+/// Helper to generate cookies
+fn make_cookies(token: &str, csrf: &str) -> Vec<String> {
+    vec![
+        format!("duet_session={}; HttpOnly; Secure; SameSite=Lax; Path=/", token),
+        format!("csrf_token={}; Secure; SameSite=Lax; Path=/", csrf),
+    ]
+}
+
+/// Registers a new account via Supabase Admin API.
 pub async fn register_op(state: &Arc<AppState>, data: Value) -> OpResult {
     let payload: AuthPayload = serde_json::from_value(data)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration payload".to_string()))?;
 
-    let user_id = Uuid::new_v4();
-    let username = payload.username.unwrap_or_else(|| "user".to_string());
-
-    // Argon2id with a per-user random salt. Storing the password as-is would make a
-    // single database read a full credential dump.
-    let password_hash = crate::password::hash_password(&payload.password)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "could not secure credentials".to_string()))?;
-
-    let query = "INSERT INTO users (id, email, username, password_hash) VALUES ($1, $2, $3, $4)";
-    sqlx::query(query).persistent(false)
-        .bind(user_id)
-        .bind(&payload.email)
-        .bind(&username)
-        .bind(&password_hash)
-        .execute(&state.main_db_pool)
+    let name = payload.username.unwrap_or_default();
+    
+    let res = state.http_client.post(&format!("{}/auth/v1/signup", state.supabase_url))
+        .header("apikey", &state.supabase_service_key)
+        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+        .json(&json!({
+            "email": payload.email,
+            "password": payload.password,
+            "data": { "name": name }
+        }))
+        .send()
         .await
-        .map_err(|err| {
-            // Logged server-side in full; the client is told only that it failed.
-            tracing::error!("Registration insert failed: {err:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "registration failed".to_string())
-        })?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "identity provider unreachable".to_string()))?;
 
-    let claims = Claims {
-        sub: user_id.to_string(),
-        exp: (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize,
-    };
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "token issuance failed".to_string()))?;
+    if !res.status().is_success() {
+        let err_body: Value = res.json().await.unwrap_or_default();
+        let msg = err_body["msg"].as_str().unwrap_or("registration failed").to_string();
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
 
-    serde_json::to_value(AuthResponse {
-        token,
-        user_id: user_id.to_string(),
-        username,
-    })
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response encoding failed".to_string()))
+    let auth_data: SupabaseAuthResponse = res.json().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response from identity provider".to_string()))?;
+
+    let csrf_token = Uuid::new_v4().to_string();
+    let cookies = make_cookies(&auth_data.access_token, &csrf_token);
+
+    let reply = json!({
+        "user_id": auth_data.user.id,
+        "username": name,
+    });
+
+    Ok((reply, Some(cookies)))
 }
 
-/// Accepts a private vent, stores it encrypted in the isolated cluster, and returns
-/// the mediated message generated for the partner.
-///
-/// `subject` is the authenticated user id resolved from the JWT. It overrides any
-/// user id present in the payload — trusting a client-supplied id here would let one
-/// account write vents attributed to another.
+/// Logs in an existing account via Supabase Admin API.
+pub async fn login_op(state: &Arc<AppState>, data: Value) -> OpResult {
+    let payload: AuthPayload = serde_json::from_value(data)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "malformed login payload".to_string()))?;
+
+    let res = state.http_client.post(&format!("{}/auth/v1/token?grant_type=password", state.supabase_url))
+        .header("apikey", &state.supabase_service_key)
+        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+        .json(&json!({
+            "email": payload.email,
+            "password": payload.password
+        }))
+        .send()
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "identity provider unreachable".to_string()))?;
+
+    if !res.status().is_success() {
+        let err_body: Value = res.json().await.unwrap_or_default();
+        let msg = err_body["error_description"].as_str().or(err_body["msg"].as_str()).unwrap_or("invalid credentials").to_string();
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
+
+    let auth_data: SupabaseAuthResponse = res.json().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response from identity provider".to_string()))?;
+
+    let csrf_token = Uuid::new_v4().to_string();
+    let cookies = make_cookies(&auth_data.access_token, &csrf_token);
+
+    let reply = json!({
+        "user_id": auth_data.user.id,
+    });
+
+    Ok((reply, Some(cookies)))
+}
+
+/// Validates the session and returns the user details.
+pub async fn session_op(_state: &Arc<AppState>, subject: Option<String>) -> OpResult {
+    let authenticated = subject.ok_or((StatusCode::UNAUTHORIZED, "authentication required".to_string()))?;
+    
+    // In a real app we'd fetch the user's name/details from the database.
+    // For now we just echo the authenticated user_id to prove the session is valid.
+    let reply = json!({
+        "user_id": authenticated
+    });
+
+    Ok((reply, None))
+}
+
+/// Accepts a private vent, stores it encrypted in the isolated cluster...
 pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>) -> OpResult {
     let payload: VentPayload = serde_json::from_value(data)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed vent payload".to_string()))?;
@@ -78,9 +126,6 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
 
     let vent_id = Uuid::new_v4();
 
-    // Encrypt before the value ever reaches the database. The column is named for
-    // encrypted content, so writing plaintext into it would leave the isolated
-    // cluster holding readable confessions while appearing protected.
     let sealed_vent = state
         .vent_cipher
         .seal(payload.raw_vent_text.as_bytes())
@@ -99,8 +144,6 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
             (StatusCode::INTERNAL_SERVER_ERROR, "could not record vent".to_string())
         })?;
 
-    // Ephemeral processing: the orchestrator receives plaintext in memory only. The
-    // moved String is dropped with this scope and is never logged.
     let agent_req = crate::orchestrator::AgentRequest {
         role: crate::orchestrator::AgentRole::ToneRewriter,
         user_id: user_id.to_string(),
@@ -117,8 +160,6 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
             (StatusCode::INTERNAL_SERVER_ERROR, "mediation unavailable".to_string())
         })?;
 
-    // The mediated message is separately worded and carries no link back to the raw
-    // vent, so the partner can never trace it to the confession that produced it.
     let mediated_id = Uuid::new_v4();
     let target_partner_uuid = payload
         .target_partner_id
@@ -139,11 +180,13 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "could not deliver mediated message".to_string()));
     }
 
-    serde_json::to_value(VentResponse {
+    let reply = serde_json::to_value(VentResponse {
         vent_id: vent_id.to_string(),
         mediated_message_id: Some(mediated_id.to_string()),
         mediated_text: agent_res.processed_output,
         tone: agent_res.emotional_rating.unwrap_or_else(|| "Calm".to_string()),
     })
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response encoding failed".to_string()))
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response encoding failed".to_string()))?;
+
+    Ok((reply, None))
 }
