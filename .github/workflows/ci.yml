@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "dev", "main" ]
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: seizmann/duet-backend
@@ -34,7 +38,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker Metadata
         if: github.event_name != 'pull_request'
