@@ -1,0 +1,106 @@
+name: RexiO Duet Backend CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "dev", "main" ]
+  pull_request:
+    branches: [ "dev", "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: seizmann/duet-backend
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Cargo Check & Tests
+        run: |
+          cargo check --verbose
+          cargo test --verbose
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Extract Docker Metadata
+        if: github.event_name != 'pull_request'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=sha
+
+      - name: Build and Push Docker Image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  deploy-and-notify:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Telegram on Failure
+        if: needs.test-and-build.result != 'success'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ⚠️ [RexiO Duet Backend] CI/CD Pipeline FAILED!
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+            Action: Deployment blocked. Please inspect GitHub Actions log.
+
+      - name: Deploy via SSH to VPS & Notify
+        if: needs.test-and-build.result == 'success' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            docker pull ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
+            docker stop duet-backend || true
+            docker rm duet-backend || true
+            docker run -d \
+              --name duet-backend \
+              --restart always \
+              -p 10000:10000 \
+              -e MAIN_DATABASE_URL="${{ secrets.MAIN_DATABASE_URL }}" \
+              -e SENSITIVE_DATABASE_URL="${{ secrets.SENSITIVE_DATABASE_URL }}" \
+              ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
+            docker image prune -f
+
+      - name: Notify Telegram on Success
+        if: needs.test-and-build.result == 'success' && github.event_name != 'pull_request'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ✅ [RexiO Duet Backend] CI/CD Deployed Successfully!
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Status: Active on VPS (Port 10000)
