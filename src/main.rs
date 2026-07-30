@@ -4,7 +4,7 @@ pub mod orchestrator;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -15,7 +15,7 @@ use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -31,6 +31,20 @@ struct SystemHealthResponse {
     main_db: String,
     sensitive_db: String,
     version: String,
+}
+
+pub const ALLOWED_ORIGINS: [&str; 2] = ["https://duet.rexio.pro", "https://duet222.rexio.pro"];
+
+pub fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(
+            ALLOWED_ORIGINS
+                .iter()
+                .map(|o| o.parse::<HeaderValue>().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 #[tokio::main]
@@ -80,17 +94,12 @@ async fn main() {
         orchestrator,
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     let app = Router::new()
         .route("/api/health", get(health_check_handler))
         .route("/api/agent/process", post(agent_process_handler))
         .route("/api/auth/register", post(register_handler))
         .route("/api/vent/process", post(vent_handler))
-        .layer(cors)
+        .layer(cors_layer())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -135,5 +144,49 @@ async fn agent_process_handler(
             Json(serde_json::json!({ "error": err })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn probe(origin: &str) -> Option<String> {
+        let app = Router::new()
+            .route("/api/health", get(|| async { "ok" }))
+            .layer(cors_layer());
+        let res = tokio::runtime::Runtime::new().unwrap().block_on(
+            app.oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/health")
+                    .header(header::ORIGIN, origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        res.unwrap()
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn only_the_two_duet_origins_are_allowed() {
+        for origin in ALLOWED_ORIGINS {
+            assert_eq!(probe(origin).as_deref(), Some(origin), "{origin} rejected");
+        }
+        for origin in [
+            "https://evil.com",
+            "http://duet.rexio.pro",
+            "https://duet.rexio.pro.evil.com",
+            "https://sub.duet.rexio.pro",
+        ] {
+            assert_eq!(probe(origin), None, "{origin} wrongly allowed");
+        }
     }
 }
