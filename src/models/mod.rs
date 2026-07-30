@@ -16,7 +16,8 @@ pub struct AuthResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VentPayload {
-    pub user_id: String,
+    // No user_id field: the author is taken from the authenticated JWT subject.
+    // Accepting it from the client would let one account file vents as another.
     pub target_partner_id: Option<String>,
     pub raw_vent_text: String,
 }

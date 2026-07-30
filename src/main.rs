@@ -1,18 +1,24 @@
+pub mod auth;
+pub mod config;
+pub mod crypto;
+pub mod gateway;
 pub mod handlers;
 pub mod models;
 pub mod orchestrator;
+pub mod password;
 
 use axum::{
     extract::State,
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use handlers::{register_handler, vent_handler};
-use orchestrator::{AgentRequest, MultiAgentOrchestrator};
+use config::Config;
+use crypto::PayloadCipher;
+use orchestrator::MultiAgentOrchestrator;
 use serde::Serialize;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
@@ -23,6 +29,13 @@ pub struct AppState {
     pub main_db_pool: PgPool,
     pub sensitive_db_pool: PgPool,
     pub orchestrator: Arc<MultiAgentOrchestrator>,
+    /// Seals and opens gateway request/response envelopes.
+    pub gateway_cipher: PayloadCipher,
+    /// Separate key for vent content at rest, so a gateway key rotation does not
+    /// invalidate stored confessions (and vice versa).
+    pub vent_cipher: PayloadCipher,
+    pub jwt_secret: String,
+    pub gateway_signing_key: String,
 }
 
 #[derive(Serialize)]
@@ -44,11 +57,21 @@ pub fn cors_layer() -> CorsLayer {
                 .collect::<Vec<_>>(),
         )
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        // The gateway's signature and trace headers must survive preflight, otherwise
+        // every signed browser request is blocked before it is sent.
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-duet-signature"),
+            HeaderName::from_static("x-duet-trace-id"),
+        ])
 }
 
 #[tokio::main]
 async fn main() {
+    // Load a local .env when present; deployed environments inject real env vars.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -57,61 +80,63 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Default Connection Strings (or read from environment)
-    let main_db_url = std::env::var("MAIN_DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres.biywvvbvzvyxkbawieff:DUET-MAN-PARSHA75vvv78@aws-0-eu-central-1.pooler.supabase.com:6543/postgres".to_string()
-    });
+    let config = Config::from_env();
 
-    let sensitive_db_url = std::env::var("SENSITIVE_DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://postgres.plyfokdbsgeoybukuogc:DUET-MAN-PARSHA75vvv78hhh2ndddd@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres".to_string()
-    });
+    let gateway_cipher = PayloadCipher::from_base64_key(&config.gateway_payload_key)
+        .expect("GATEWAY_PAYLOAD_KEY must be a base64-encoded 32-byte key");
+    let vent_cipher = PayloadCipher::from_base64_key(&config.vent_encryption_key)
+        .expect("VENT_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
 
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "40000".to_string())
-        .parse()
-        .unwrap_or(40000);
+    // Transaction-mode poolers (PgBouncer, port 6543) hand each query a different
+    // server connection, so server-side prepared statements collide across requests
+    // with "prepared statement already exists". Queries must therefore be issued
+    // non-persistently — see `persistent(false)` on each query in `handlers`. The
+    // cache is also zeroed here so sqlx allocates no statement names of its own.
+    let pool_options = |url: &str| -> Result<PgConnectOptions, sqlx::Error> {
+        Ok(url.parse::<PgConnectOptions>()?.statement_cache_capacity(0))
+    };
 
-    // PgBouncer connection pooling
     let main_db_pool = PgPoolOptions::new()
         .max_connections(20)
-        .connect(&main_db_url)
+        .connect_with(pool_options(&config.main_db_url).expect("invalid main database URL"))
         .await
-        .expect("Failed to connect to Main PostgreSQL DB pool");
+        .expect("Failed to connect to Primary SQL Storage pool");
 
     let sensitive_db_pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&sensitive_db_url)
+        .connect_with(pool_options(&config.sensitive_db_url).expect("invalid sensitive database URL"))
         .await
-        .expect("Failed to connect to Sensitive Isolated PostgreSQL DB pool");
+        .expect("Failed to connect to Isolated Postgres Cluster pool");
 
     tracing::info!("Successfully established connection pools to both PostgreSQL instances.");
-
-    let orchestrator = Arc::new(MultiAgentOrchestrator::new());
 
     let state = Arc::new(AppState {
         main_db_pool,
         sensitive_db_pool,
-        orchestrator,
+        orchestrator: Arc::new(MultiAgentOrchestrator::new()),
+        gateway_cipher,
+        vent_cipher,
+        jwt_secret: config.jwt_secret,
+        gateway_signing_key: config.gateway_signing_key,
     });
 
+    // One public operational surface: every client action flows through /api/gateway
+    // as an encrypted envelope. Per-operation routes are gone — the operation now
+    // lives inside the encrypted body, addressed by action code.
     let app = Router::new()
+        .route("/api/gateway", post(gateway::gateway_handler))
         .route("/api/health", get(health_check_handler))
-        .route("/api/agent/process", post(agent_process_handler))
-        .route("/api/auth/register", post(register_handler))
-        .route("/api/vent/process", post(vent_handler))
         .layer(cors_layer())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     tracing::info!("RexiO Duet Real Backend running on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health_check_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn health_check_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let main_db_status = match sqlx::query("SELECT 1").execute(&state.main_db_pool).await {
         Ok(_) => "Connected",
         Err(_) => "Disconnected",
@@ -131,20 +156,6 @@ async fn health_check_handler(
             version: "1.0.0".to_string(),
         }),
     )
-}
-
-async fn agent_process_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<AgentRequest>,
-) -> impl IntoResponse {
-    match state.orchestrator.process_request(payload).await {
-        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err })),
-        )
-            .into_response(),
-    }
 }
 
 #[cfg(test)]
