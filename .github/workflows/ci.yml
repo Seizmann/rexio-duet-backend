@@ -97,14 +97,27 @@ jobs:
               ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
             docker image prune -f
 
-      - name: Notify Telegram on Success
-        if: needs.test-and-build.result == 'success' && github.event_name != 'pull_request'
+      - name: Notify Telegram — Dev Branch Image Ready
+        if: needs.test-and-build.result == 'success' && github.ref == 'refs/heads/dev' && github.event_name != 'pull_request'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           message: |
-            ✅ [RexiO Duet Backend] CI/CD Deployed Successfully!
+            [RexiO Duet Backend] Dev CI Passed - New Image Ready on GHCR!
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Image: ghcr.io/seizmann/duet-backend:dev
+            Action: Run `rexio-duet-agent-cli dev-watch` on local machine to auto-pull.
+
+      - name: Notify Telegram — Production Deployed
+        if: needs.test-and-build.result == 'success' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            [RexiO Duet Backend] Production Deployed Successfully!
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
             Status: Active on VPS (Port 10000)
