@@ -96,9 +96,11 @@ jobs:
             docker pull ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
             docker stop duet-backend || true
             docker rm duet-backend || true
+            docker network create duet-network || true
             docker run -d \
               --name duet-backend \
               --restart always \
+              --network duet-network \
               -p 127.0.0.1:40000:40000 \
               -e MAIN_DATABASE_URL="${{ secrets.MAIN_DATABASE_URL }}" \
               -e SENSITIVE_DATABASE_URL="${{ secrets.SENSITIVE_DATABASE_URL }}" \
