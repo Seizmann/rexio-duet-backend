@@ -102,6 +102,10 @@ jobs:
               -p 127.0.0.1:40000:40000 \
               -e MAIN_DATABASE_URL="${{ secrets.MAIN_DATABASE_URL }}" \
               -e SENSITIVE_DATABASE_URL="${{ secrets.SENSITIVE_DATABASE_URL }}" \
+              -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+              -e GATEWAY_PAYLOAD_KEY="${{ secrets.GATEWAY_PAYLOAD_KEY }}" \
+              -e GATEWAY_SIGNING_KEY="${{ secrets.GATEWAY_SIGNING_KEY }}" \
+              -e VENT_ENCRYPTION_KEY="${{ secrets.VENT_ENCRYPTION_KEY }}" \
               ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
             docker image prune -f
 
