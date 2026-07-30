@@ -80,18 +80,26 @@ jobs:
       - name: Deploy via SSH to VPS & Notify
         if: needs.test-and-build.result == 'success' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: root
           key: ${{ secrets.VPS_SSH_KEY }}
+          # Abort on the first failing command. Without this the ssh-action swallows
+          # non-zero exits and a broken deploy still reports success.
+          script_stop: true
+          envs: GHCR_USER,GHCR_TOKEN
           script: |
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             docker pull ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
             docker stop duet-backend || true
             docker rm duet-backend || true
             docker run -d \
               --name duet-backend \
               --restart always \
-              -p 10000:10000 \
+              -p 127.0.0.1:40000:40000 \
               -e MAIN_DATABASE_URL="${{ secrets.MAIN_DATABASE_URL }}" \
               -e SENSITIVE_DATABASE_URL="${{ secrets.SENSITIVE_DATABASE_URL }}" \
               ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
@@ -120,4 +128,4 @@ jobs:
             [RexiO Duet Backend] Production Deployed Successfully!
             Branch: ${{ github.ref_name }}
             Commit: ${{ github.sha }}
-            Status: Active on VPS (Port 10000)
+            Status: Active on VPS (Port 40000)
