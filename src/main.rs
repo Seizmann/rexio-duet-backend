@@ -53,9 +53,9 @@ async fn main() {
     });
 
     let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "10000".to_string())
+        .unwrap_or_else(|_| "40000".to_string())
         .parse()
-        .unwrap_or(10000);
+        .unwrap_or(40000);
 
     // PgBouncer connection pooling
     let main_db_pool = PgPoolOptions::new()
