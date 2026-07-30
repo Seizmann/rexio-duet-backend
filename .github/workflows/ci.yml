@@ -106,6 +106,8 @@ jobs:
               -e GATEWAY_PAYLOAD_KEY="${{ secrets.GATEWAY_PAYLOAD_KEY }}" \
               -e GATEWAY_SIGNING_KEY="${{ secrets.GATEWAY_SIGNING_KEY }}" \
               -e VENT_ENCRYPTION_KEY="${{ secrets.VENT_ENCRYPTION_KEY }}" \
+              -e SUPABASE_URL="${{ secrets.SUPABASE_URL }}" \
+              -e SUPABASE_SERVICE_KEY="${{ secrets.SUPABASE_SERVICE_KEY }}" \
               ghcr.io/seizmann/duet-backend:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
             docker image prune -f
 
