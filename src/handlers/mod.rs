@@ -1,7 +1,7 @@
-use crate::models::{AuthPayload, AuthResponse, VentPayload, VentResponse};
+use crate::models::{AuthPayload, VentPayload, VentResponse};
 use crate::AppState;
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;

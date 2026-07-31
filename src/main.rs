@@ -34,7 +34,9 @@ pub struct AppState {
     /// Separate key for vent content at rest, so a gateway key rotation does not
     /// invalidate stored confessions (and vice versa).
     pub vent_cipher: PayloadCipher,
-    pub jwt_secret: String,
+    /// Identity-provider verification keys, indexed by `kid`. Supabase signs with
+    /// ES256; the legacy HS256 secret verifies nothing it issues.
+    pub jwt_keys: auth::JwtKeys,
     pub gateway_signing_key: String,
     pub supabase_url: String,
     pub supabase_service_key: String,
@@ -113,17 +115,22 @@ async fn main() {
 
     tracing::info!("Successfully established connection pools to both PostgreSQL instances.");
 
+    let http_client = reqwest::Client::new();
+    let jwt_keys = auth::fetch_jwks(&http_client, &config.supabase_url)
+        .await
+        .expect("Could not load identity-provider verification keys; every session would be rejected");
+
     let state = Arc::new(AppState {
         main_db_pool,
         sensitive_db_pool,
         orchestrator: Arc::new(MultiAgentOrchestrator::new()),
         gateway_cipher,
         vent_cipher,
-        jwt_secret: config.jwt_secret,
+        jwt_keys,
         gateway_signing_key: config.gateway_signing_key,
         supabase_url: config.supabase_url,
         supabase_service_key: config.supabase_service_key,
-        http_client: reqwest::Client::new(),
+        http_client,
     });
 
     // One public operational surface: every client action flows through /api/gateway

@@ -11,13 +11,35 @@
 mod crypto;
 #[path = "../src/password/mod.rs"]
 mod password;
+#[path = "../src/auth/mod.rs"]
+mod auth;
 
+use auth::{subject_from_headers, JwtKeys};
+use axum::http::{header, HeaderMap};
 use crypto::{compute_signature, verify_signature, PayloadCipher};
 use password::{hash_password, verify_password};
 
 /// Test-only key material. Real keys come from the environment; see .env.example.
 const TEST_KEY: &str = "hMZLKtN3wtC/Tll2MDjrasBqTX5Oza9NBHEr8B8Etus=";
 const OTHER_KEY: &str = "U9AqHqREHiu22Cb5CSL4FQdaSlvtxgZkErvCi15wCos=";
+
+/// Test-only ES256 keypairs. Supabase signs sessions with ES256 against a published
+/// JWKS, so the auth path cannot be exercised with a symmetric secret.
+const TEST_KID: &str = "test-kid";
+const KEY_A_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNkTDJDWF7rVExavE\nIKDZ1lK3yO2rjzpfUniIXLDI8bqhRANCAATmNIEYzSwXf3H2LBp/a3AbDSt/yVlH\n5dzBrADx19222qIlVMWpCKiZM1Izl+DUa7DrUEEDLa/ULd4OAPxfrqRZ\n-----END PRIVATE KEY-----\n";
+const KEY_A_X: &str = "5jSBGM0sF39x9iwaf2twGw0rf8lZR-XcwawA8dfdtto";
+const KEY_A_Y: &str = "oiVUxakIqJkzUjOX4NRrsOtQQQMtr9Qt3g4A_F-upFk";
+const KEY_B_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRic9BdlRE8XA4YLN\nZATB3UCChyJHZRf/PRAhF6GndYGhRANCAAQOMeWJjb/UPNmM5ztUm3IO2WLmvL7a\neX+deErRKYFci4xECDfTk22KFz95OzWzcUEbFnXFi8duYMXhz+bHEAbl\n-----END PRIVATE KEY-----\n";
+
+fn signing_key(pem: &str) -> jsonwebtoken::EncodingKey {
+    jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).expect("valid EC private key")
+}
+
+/// The published verification key set, as the backend would load it from JWKS.
+fn published_keys() -> JwtKeys {
+    let key = jsonwebtoken::DecodingKey::from_ec_components(KEY_A_X, KEY_A_Y).expect("valid EC point");
+    JwtKeys::from([(TEST_KID.to_string(), key)])
+}
 
 fn cipher() -> PayloadCipher {
     PayloadCipher::from_base64_key(TEST_KEY).expect("valid test key")
@@ -118,4 +140,61 @@ fn passwords_are_hashed_not_stored() {
 
     // Distinct salts: two users with the same password must not share a hash.
     assert_ne!(hash, hash_password(password).expect("hash"));
+}
+
+/// The session token travels in the `duet_session` cookie — no client sends an
+/// `Authorization` header. Reading the wrong header made every authenticated op
+/// return 401, so a logged-in user always fell through to the landing page.
+///
+/// Signed here with ES256 because that is what Supabase issues; the project's
+/// `JWT_SECRET` is its legacy HS256 secret and verifies none of its tokens.
+#[test]
+fn subject_is_read_from_the_session_cookie() {
+    let encoding = signing_key(KEY_A_PEM);
+    let keys = published_keys();
+    let sub = "8f2a1c40-0000-4000-8000-000000000001";
+
+    let sign = |claims: serde_json::Value| {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_string());
+        jsonwebtoken::encode(&header, &claims, &encoding).expect("encode")
+    };
+    let valid = sign(serde_json::json!({ "sub": sub, "aud": "authenticated", "exp": 4_102_444_800u64 }));
+
+    let subject_for = |cookie: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        subject_from_headers(&headers, &keys)
+    };
+
+    assert_eq!(subject_for(&format!("duet_session={valid}")).as_deref(), Some(sub));
+    // Real browsers send it alongside the CSRF cookie, in either order.
+    assert_eq!(
+        subject_for(&format!("csrf_token=abc; duet_session={valid}")).as_deref(),
+        Some(sub)
+    );
+
+    assert_eq!(subject_for("csrf_token=abc"), None, "no session cookie");
+    assert_eq!(subject_for("duet_session=garbage"), None, "malformed token");
+    assert_eq!(subject_from_headers(&HeaderMap::new(), &keys), None, "no cookie header");
+
+    // Expired.
+    let expired = sign(serde_json::json!({ "sub": sub, "aud": "authenticated", "exp": 1_600_000_000u64 }));
+    assert_eq!(subject_for(&format!("duet_session={expired}")), None, "expired token accepted");
+
+    // Wrong audience: service and anonymous tokens must not pass as a user.
+    let wrong_aud = sign(serde_json::json!({ "sub": sub, "aud": "service_role", "exp": 4_102_444_800u64 }));
+    assert_eq!(subject_for(&format!("duet_session={wrong_aud}")), None, "wrong audience accepted");
+
+    // Signed by an attacker's key, under a kid we do publish.
+    let attacker = signing_key(KEY_B_PEM);
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(TEST_KID.to_string());
+    let forged = jsonwebtoken::encode(
+        &header,
+        &serde_json::json!({ "sub": sub, "aud": "authenticated", "exp": 4_102_444_800u64 }),
+        &attacker,
+    )
+    .expect("encode");
+    assert_eq!(subject_for(&format!("duet_session={forged}")), None, "forged signature accepted");
 }

@@ -107,7 +107,7 @@ pub async fn gateway_handler(
         .or_else(|| headers.get(TRACE_HEADER).and_then(|v| v.to_str().ok()).map(String::from))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let subject = crate::auth::subject_from_headers(&headers, &state.jwt_secret);
+    let subject = crate::auth::subject_from_headers(&headers, &state.jwt_keys);
 
     if requires_auth(&envelope.op) && subject.is_none() {
         tracing::warn!(op = %envelope.op, trace_id = %trace_id, "Gateway request rejected: op requires an authenticated subject");
