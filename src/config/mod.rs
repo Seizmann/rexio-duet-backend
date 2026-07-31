@@ -24,7 +24,6 @@ fn require(key: &str) -> String {
 pub struct Config {
     pub main_db_url: String,
     pub sensitive_db_url: String,
-    pub jwt_secret: String,
     pub gateway_payload_key: String,
     pub gateway_signing_key: String,
     pub vent_encryption_key: String,
@@ -38,7 +37,6 @@ impl Config {
         Self {
             main_db_url: require("MAIN_DATABASE_URL"),
             sensitive_db_url: require("SENSITIVE_DATABASE_URL"),
-            jwt_secret: require("JWT_SECRET"),
             gateway_payload_key: require("GATEWAY_PAYLOAD_KEY"),
             gateway_signing_key: require("GATEWAY_SIGNING_KEY"),
             vent_encryption_key: require("VENT_ENCRYPTION_KEY"),
