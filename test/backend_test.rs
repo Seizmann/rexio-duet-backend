@@ -19,9 +19,14 @@ use axum::http::{header, HeaderMap};
 use crypto::{compute_signature, verify_signature, PayloadCipher};
 use password::{hash_password, verify_password};
 
-/// Test-only key material. Real keys come from the environment; see .env.example.
-const TEST_KEY: &str = "hMZLKtN3wtC/Tll2MDjrasBqTX5Oza9NBHEr8B8Etus=";
-const OTHER_KEY: &str = "U9AqHqREHiu22Cb5CSL4FQdaSlvtxgZkErvCi15wCos=";
+/// Test-only key material — deliberately not a value any environment uses.
+///
+/// These two constants previously held the live `GATEWAY_PAYLOAD_KEY` and
+/// `GATEWAY_SIGNING_KEY` verbatim, which put the keys that seal every gateway
+/// payload into the Git history of a repository that publishes container images.
+/// Both were rotated; the replacements below exist only here and unlock nothing.
+const TEST_KEY: &str = "ojtxuEvjhv8RP2DXbG+e6Umfiuju8v93adQUvN/r3pI=";
+const OTHER_KEY: &str = "9uqiFYOIOEcT5yNQVT9at8rSWaBHwh8PGBmF2aReiho=";
 
 /// Test-only ES256 keypairs. Supabase signs sessions with ES256 against a published
 /// JWKS, so the auth path cannot be exercised with a symmetric secret.
