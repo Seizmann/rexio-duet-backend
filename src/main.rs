@@ -6,7 +6,7 @@ pub mod gateway;
 pub mod handlers;
 pub mod models;
 pub mod orchestrator;
-pub mod password;
+pub mod profile;
 
 use axum::{
     extract::State,
@@ -35,12 +35,12 @@ pub struct AppState {
     /// Separate key for vent content at rest, so a gateway key rotation does not
     /// invalidate stored confessions (and vice versa).
     pub vent_cipher: PayloadCipher,
-    /// Identity-provider verification keys, indexed by `kid`. Supabase signs with
-    /// ES256; the legacy HS256 secret verifies nothing it issues.
+    /// Identity-provider verification keys, indexed by `kid`. Sessions are signed
+    /// with ES256; the legacy HS256 secret verifies nothing the provider issues.
     pub jwt_keys: auth::JwtKeys,
     pub gateway_signing_key: String,
-    pub supabase_url: String,
-    pub supabase_service_key: String,
+    pub identity_url: String,
+    pub identity_service_key: String,
     pub http_client: reqwest::Client,
 }
 
@@ -123,7 +123,7 @@ async fn main() {
         .expect("Schema migrations failed; refusing to serve against an unknown schema");
 
     let http_client = reqwest::Client::new();
-    let jwt_keys = auth::fetch_jwks(&http_client, &config.supabase_url)
+    let jwt_keys = auth::fetch_jwks(&http_client, &config.identity_url)
         .await
         .expect("Could not load identity-provider verification keys; every session would be rejected");
 
@@ -135,8 +135,8 @@ async fn main() {
         vent_cipher,
         jwt_keys,
         gateway_signing_key: config.gateway_signing_key,
-        supabase_url: config.supabase_url,
-        supabase_service_key: config.supabase_service_key,
+        identity_url: config.identity_url,
+        identity_service_key: config.identity_service_key,
         http_client,
     });
 

@@ -10,13 +10,13 @@ use uuid::Uuid;
 pub type OpResult = Result<(Value, Option<Vec<String>>), (StatusCode, String)>;
 
 #[derive(Deserialize)]
-struct SupabaseAuthResponse {
+struct IdentityTokenResponse {
     access_token: String,
-    user: SupabaseUser,
+    user: IdentityUser,
 }
 
 #[derive(Deserialize)]
-struct SupabaseUser {
+struct IdentityUser {
     id: String,
 }
 
@@ -28,16 +28,17 @@ fn make_cookies(token: &str, csrf: &str) -> Vec<String> {
     ]
 }
 
-/// Registers a new account via Supabase Admin API.
+/// Registers a new account with the identity cluster and mirrors it into a profile row.
 pub async fn register_op(state: &Arc<AppState>, data: Value) -> OpResult {
     let payload: AuthPayload = serde_json::from_value(data)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed registration payload".to_string()))?;
 
     let name = payload.username.unwrap_or_default();
-    
-    let res = state.http_client.post(&format!("{}/auth/v1/signup", state.supabase_url))
-        .header("apikey", &state.supabase_service_key)
-        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+    let email = payload.email.clone();
+
+    let res = state.http_client.post(&format!("{}/auth/v1/signup", state.identity_url))
+        .header("apikey", &state.identity_service_key)
+        .header("Authorization", format!("Bearer {}", state.identity_service_key))
         .json(&json!({
             "email": payload.email,
             "password": payload.password,
@@ -53,8 +54,17 @@ pub async fn register_op(state: &Arc<AppState>, data: Value) -> OpResult {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
 
-    let auth_data: SupabaseAuthResponse = res.json().await
+    let auth_data: IdentityTokenResponse = res.json().await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response from identity provider".to_string()))?;
+
+    // Every foreign key in the main schema points at this row, so without it the
+    // account exists but can do nothing. It is still not worth failing the
+    // registration over: the identity record is already created and cannot be
+    // rolled back, so a failure here would hand the user working credentials while
+    // telling them signup failed. `session_op` repairs it on the next request.
+    if let Err(err) = crate::profile::create(state, &auth_data.user.id, &email, &name).await {
+        tracing::error!(user_id = %auth_data.user.id, "Profile row not written at registration: {err:?}");
+    }
 
     let csrf_token = Uuid::new_v4().to_string();
     let cookies = make_cookies(&auth_data.access_token, &csrf_token);
@@ -67,14 +77,14 @@ pub async fn register_op(state: &Arc<AppState>, data: Value) -> OpResult {
     Ok((reply, Some(cookies)))
 }
 
-/// Logs in an existing account via Supabase Admin API.
+/// Exchanges credentials for a session with the identity cluster.
 pub async fn login_op(state: &Arc<AppState>, data: Value) -> OpResult {
     let payload: AuthPayload = serde_json::from_value(data)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed login payload".to_string()))?;
 
-    let res = state.http_client.post(&format!("{}/auth/v1/token?grant_type=password", state.supabase_url))
-        .header("apikey", &state.supabase_service_key)
-        .header("Authorization", format!("Bearer {}", state.supabase_service_key))
+    let res = state.http_client.post(&format!("{}/auth/v1/token?grant_type=password", state.identity_url))
+        .header("apikey", &state.identity_service_key)
+        .header("Authorization", format!("Bearer {}", state.identity_service_key))
         .json(&json!({
             "email": payload.email,
             "password": payload.password
@@ -89,7 +99,7 @@ pub async fn login_op(state: &Arc<AppState>, data: Value) -> OpResult {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
 
-    let auth_data: SupabaseAuthResponse = res.json().await
+    let auth_data: IdentityTokenResponse = res.json().await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response from identity provider".to_string()))?;
 
     let csrf_token = Uuid::new_v4().to_string();
@@ -102,17 +112,17 @@ pub async fn login_op(state: &Arc<AppState>, data: Value) -> OpResult {
     Ok((reply, Some(cookies)))
 }
 
-/// Validates the session and returns the user details.
-pub async fn session_op(_state: &Arc<AppState>, subject: Option<String>) -> OpResult {
+/// Validates the session and returns the user's profile.
+///
+/// Doubles as the repair path for a missing profile row — see `profile::ensure`.
+pub async fn session_op(state: &Arc<AppState>, subject: Option<String>) -> OpResult {
     let authenticated = subject.ok_or((StatusCode::UNAUTHORIZED, "authentication required".to_string()))?;
-    
-    // In a real app we'd fetch the user's name/details from the database.
-    // For now we just echo the authenticated user_id to prove the session is valid.
-    let reply = json!({
-        "user_id": authenticated
-    });
 
-    Ok((reply, None))
+    let profile = crate::profile::ensure(state, &authenticated)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
+    Ok((profile, None))
 }
 
 /// Accepts a private vent, stores it encrypted in the isolated cluster...

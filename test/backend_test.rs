@@ -1,7 +1,7 @@
 //! Backend security checks.
 //!
 //! These cover the security-critical paths added with the encrypted gateway: payload
-//! confidentiality, tamper rejection, signature verification, and password hashing.
+//! confidentiality, tamper rejection, signature verification, and session decoding.
 //!
 //! The modules under test are pulled in by path rather than through a library target,
 //! since this crate ships as a binary. Both are self-contained and touch no shared
@@ -9,15 +9,12 @@
 
 #[path = "../src/crypto/mod.rs"]
 mod crypto;
-#[path = "../src/password/mod.rs"]
-mod password;
 #[path = "../src/auth/mod.rs"]
 mod auth;
 
 use auth::{subject_from_headers, JwtKeys};
 use axum::http::{header, HeaderMap};
 use crypto::{compute_signature, verify_signature, PayloadCipher};
-use password::{hash_password, verify_password};
 
 /// Test-only key material — deliberately not a value any environment uses.
 ///
@@ -28,7 +25,7 @@ use password::{hash_password, verify_password};
 const TEST_KEY: &str = "ojtxuEvjhv8RP2DXbG+e6Umfiuju8v93adQUvN/r3pI=";
 const OTHER_KEY: &str = "9uqiFYOIOEcT5yNQVT9at8rSWaBHwh8PGBmF2aReiho=";
 
-/// Test-only ES256 keypairs. Supabase signs sessions with ES256 against a published
+/// Test-only ES256 keypairs. Sessions are signed with ES256 against a published
 /// JWKS, so the auth path cannot be exercised with a symmetric secret.
 const TEST_KID: &str = "test-kid";
 const KEY_A_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNkTDJDWF7rVExavE\nIKDZ1lK3yO2rjzpfUniIXLDI8bqhRANCAATmNIEYzSwXf3H2LBp/a3AbDSt/yVlH\n5dzBrADx19222qIlVMWpCKiZM1Izl+DUa7DrUEEDLa/ULd4OAPxfrqRZ\n-----END PRIVATE KEY-----\n";
@@ -133,26 +130,12 @@ fn signature_verifies_only_for_matching_body_and_key() {
     assert!(verify_signature("signing-key", body, "zz").is_err());
 }
 
-#[test]
-fn passwords_are_hashed_not_stored() {
-    let password = "DUET-correct-horse-battery";
-    let hash = hash_password(password).expect("hash");
-
-    assert!(!hash.contains(password), "password recoverable from hash");
-    assert!(hash.starts_with("$argon2"), "unexpected hash format: {hash}");
-    assert!(verify_password(password, &hash));
-    assert!(!verify_password("wrong-password", &hash));
-
-    // Distinct salts: two users with the same password must not share a hash.
-    assert_ne!(hash, hash_password(password).expect("hash"));
-}
-
 /// The session token travels in the `duet_session` cookie — no client sends an
 /// `Authorization` header. Reading the wrong header made every authenticated op
 /// return 401, so a logged-in user always fell through to the landing page.
 ///
-/// Signed here with ES256 because that is what Supabase issues; the project's
-/// `JWT_SECRET` is its legacy HS256 secret and verifies none of its tokens.
+/// Signed here with ES256 because that is what the identity provider issues; the
+/// project's `JWT_SECRET` is its legacy HS256 secret and verifies none of its tokens.
 #[test]
 fn subject_is_read_from_the_session_cookie() {
     let encoding = signing_key(KEY_A_PEM);
@@ -202,4 +185,69 @@ fn subject_is_read_from_the_session_cookie() {
     )
     .expect("encode");
     assert_eq!(subject_for(&format!("duet_session={forged}")), None, "forged signature accepted");
+}
+
+/// Reads every Rust source file under `src/`.
+///
+/// The two checks below are assertions about the source itself, not about runtime
+/// behaviour. They live here because the alternative — importing the modules by path
+/// — would drag in `AppState` and with it a database connection, which this suite
+/// deliberately does without.
+fn source_files() -> Vec<(std::path::PathBuf, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).expect("readable source directory") {
+            let path = entry.expect("readable entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("readable source file");
+                out.push((path, text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(std::path::Path::new("src"), &mut out);
+    assert!(!out.is_empty(), "found no source files to check");
+    out
+}
+
+/// The profile row is written on a path that cannot be rolled back: the identity
+/// record already exists by the time the insert runs, and the same insert runs again
+/// as a back-fill whenever a session finds no profile. Both depend on repeating the
+/// insert being harmless, so the conflict clause is load-bearing rather than
+/// defensive.
+#[test]
+fn profile_insert_is_idempotent() {
+    let profile = std::fs::read_to_string("src/profile/mod.rs").expect("profile module");
+    let sql_start = profile.find("INSERT_PROFILE_SQL").expect("insert statement is a named const");
+    let sql = &profile[sql_start..];
+
+    assert!(
+        sql.contains("ON CONFLICT (id) DO NOTHING"),
+        "the profile insert must be safe to repeat — it runs again as a back-fill",
+    );
+    assert!(
+        profile.contains(".persistent(false)"),
+        "queries must be non-persistent: the pooler is transaction-mode",
+    );
+}
+
+/// AGENTS.md forbids naming the database vendor anywhere in source. The rule had no
+/// enforcement, and by the time it was written the code had already broken it in four
+/// places. An unenforced rule teaches the next agent to skip the whole file.
+#[test]
+fn database_vendor_is_not_named_in_source() {
+    // The two environment variable names are the documented exception: they are CI and
+    // VPS secrets, so renaming them would break every deploy.
+    const ALLOWED: [&str; 2] = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"];
+
+    for (path, text) in source_files() {
+        let scrubbed = ALLOWED.iter().fold(text, |acc, name| acc.replace(name, ""));
+        assert!(
+            !scrubbed.to_lowercase().contains("supabase"),
+            "{} names the database vendor — use \"identity provider\", \
+             \"Primary SQL Storage\" or \"Isolated Postgres Cluster\"",
+            path.display(),
+        );
+    }
 }

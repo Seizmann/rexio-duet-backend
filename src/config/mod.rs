@@ -27,8 +27,8 @@ pub struct Config {
     pub gateway_payload_key: String,
     pub gateway_signing_key: String,
     pub vent_encryption_key: String,
-    pub supabase_url: String,
-    pub supabase_service_key: String,
+    pub identity_url: String,
+    pub identity_service_key: String,
     pub port: u16,
 }
 
@@ -40,8 +40,12 @@ impl Config {
             gateway_payload_key: require("GATEWAY_PAYLOAD_KEY"),
             gateway_signing_key: require("GATEWAY_SIGNING_KEY"),
             vent_encryption_key: require("VENT_ENCRYPTION_KEY"),
-            supabase_url: require("SUPABASE_URL"),
-            supabase_service_key: require("SUPABASE_SERVICE_KEY"),
+            // These two variable names still carry the vendor's name. They are CI and
+            // VPS secrets, so renaming them breaks every deploy until each store is
+            // updated by hand — not worth it for tidiness. The fields they populate
+            // are named for what they are.
+            identity_url: require("SUPABASE_URL"),
+            identity_service_key: require("SUPABASE_SERVICE_KEY"),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())

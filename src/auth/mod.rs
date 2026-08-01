@@ -1,9 +1,9 @@
 //! JWT subject resolution.
 //!
-//! Sessions are Supabase-issued access tokens, signed **ES256** with a rotating
-//! asymmetric key — the project's `JWT_SECRET` is Supabase's *legacy* HS256 secret and
-//! no longer verifies anything it issues. Verification therefore runs against the
-//! published JWKS.
+//! Sessions are access tokens issued by the identity provider, signed **ES256**
+//! with a rotating asymmetric key — the project's `JWT_SECRET` is that provider's
+//! *legacy* HS256 secret and no longer verifies anything it issues. Verification
+//! therefore runs against the published JWKS.
 //!
 //! The proxy layer only checks that the session cookie looks like a JWT. The
 //! authoritative decode — and therefore the identity every operation acts on — happens
@@ -15,7 +15,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Supabase access tokens carry `aud: "authenticated"` for signed-in users. Anonymous
+/// Issued access tokens carry `aud: "authenticated"` for signed-in users. Anonymous
 /// and service tokens do not, so requiring it keeps them out of user operations.
 const EXPECTED_AUDIENCE: &str = "authenticated";
 
@@ -30,12 +30,12 @@ pub type JwtKeys = HashMap<String, DecodingKey>;
 
 /// Fetches the identity provider's JWKS.
 ///
-/// ponytail: fetched once at startup, not cached with a TTL. Supabase signing keys
-/// rotate manually and rarely; a rotation needs a container restart. Add background
-/// refresh only if rotation ever becomes automatic.
+/// ponytail: fetched once at startup, not cached with a TTL. The provider's signing
+/// keys rotate manually and rarely; a rotation needs a container restart. Add
+/// background refresh only if rotation ever becomes automatic.
 #[allow(dead_code)] // Used by main; invisible to the path-imported test harness.
-pub async fn fetch_jwks(client: &reqwest::Client, supabase_url: &str) -> Result<JwtKeys, String> {
-    let url = format!("{}/auth/v1/.well-known/jwks.json", supabase_url.trim_end_matches('/'));
+pub async fn fetch_jwks(client: &reqwest::Client, identity_url: &str) -> Result<JwtKeys, String> {
+    let url = format!("{}/auth/v1/.well-known/jwks.json", identity_url.trim_end_matches('/'));
 
     let set: JwkSet = client
         .get(&url)
