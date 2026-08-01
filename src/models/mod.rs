@@ -8,13 +8,6 @@ pub struct AuthPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AuthResponse {
-    pub token: String,
-    pub user_id: String,
-    pub username: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct VentPayload {
     // No user_id field: the author is taken from the authenticated JWT subject.
     // Accepting it from the client would let one account file vents as another.
@@ -27,5 +20,7 @@ pub struct VentResponse {
     pub vent_id: String,
     pub mediated_message_id: Option<String>,
     pub mediated_text: String,
-    pub tone: String,
+    /// Absent unless an agent actually assessed the tone. This used to default to
+    /// "Calm", stating a judgement on every message that nothing had made.
+    pub tone: Option<String>,
 }

@@ -59,6 +59,7 @@ async fn dispatch(
     op: &str,
     data: Value,
     subject: Option<String>,
+    trace_id: Option<uuid::Uuid>,
 ) -> OpResult {
     match op {
         // a1 — account registration
@@ -68,7 +69,7 @@ async fn dispatch(
         // a3 — session validation / get user
         "a3" => crate::handlers::session_op(state, subject).await,
         // v2 — private vent submission
-        "v2" => vent_op(state, data, subject).await,
+        "v2" => vent_op(state, data, subject, trace_id).await,
         _ => Err((StatusCode::BAD_REQUEST, "unknown operation".to_string())),
     }
 }
@@ -115,7 +116,10 @@ pub async fn gateway_handler(
     }
 
     let started = std::time::Instant::now();
-    let outcome = dispatch(&state, &envelope.op, envelope.data, subject).await;
+    // Only a UUID-shaped trace id can be carried into the audit trail, whose column is
+    // typed. A client-supplied string still reaches the logs either way.
+    let audit_id = uuid::Uuid::parse_str(&trace_id).ok();
+    let outcome = dispatch(&state, &envelope.op, envelope.data, subject, audit_id).await;
     
     tracing::info!(
         op = %envelope.op,

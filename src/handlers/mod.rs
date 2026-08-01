@@ -125,8 +125,14 @@ pub async fn session_op(state: &Arc<AppState>, subject: Option<String>) -> OpRes
     Ok((profile, None))
 }
 
-/// Accepts a private vent, stores it encrypted in the isolated cluster...
-pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>) -> OpResult {
+/// Accepts a private vent, seals it into the isolated cluster, and sends the mediated
+/// rewrite — never the original words — on to the partner.
+pub async fn vent_op(
+    state: &Arc<AppState>,
+    data: Value,
+    subject: Option<String>,
+    trace_id: Option<Uuid>,
+) -> OpResult {
     let payload: VentPayload = serde_json::from_value(data)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed vent payload".to_string()))?;
 
@@ -161,14 +167,15 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
         input_text: payload.raw_vent_text,
     };
 
+    // The vent is already stored, so a mediation failure loses nothing the user wrote.
+    // The message surfaced here is the orchestrator's, which distinguishes "not
+    // configured" from "temporarily unavailable" — the first needs an operator, the
+    // second needs a retry, and a single generic string would hide which.
     let agent_res = state
         .orchestrator
-        .process_request(agent_req)
+        .process_request(agent_req, trace_id)
         .await
-        .map_err(|err| {
-            tracing::error!("Orchestrator failed: {err}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "mediation unavailable".to_string())
-        })?;
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let mediated_id = Uuid::new_v4();
     let target_partner_uuid = payload
@@ -194,7 +201,9 @@ pub async fn vent_op(state: &Arc<AppState>, data: Value, subject: Option<String>
         vent_id: vent_id.to_string(),
         mediated_message_id: Some(mediated_id.to_string()),
         mediated_text: agent_res.processed_output,
-        tone: agent_res.emotional_rating.unwrap_or_else(|| "Calm".to_string()),
+        // Absent unless an agent actually assessed it. This used to default to "Calm",
+        // which reported a judgement on every message that nothing had made.
+        tone: agent_res.emotional_rating,
     })
     .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response encoding failed".to_string()))?;
 

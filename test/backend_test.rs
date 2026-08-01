@@ -12,6 +12,15 @@ mod crypto;
 #[path = "../src/auth/mod.rs"]
 mod auth;
 
+// Only the response parser is exercised here — the request path needs a
+// database-resolved config this suite deliberately does without. The parser is a pure
+// function over a body precisely so it can be tested offline; the rest of the module
+// comes along with the path import and reads as dead code from here.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/ai/mod.rs"]
+mod ai;
+
+use ai::{parse_completion, AiError};
 use auth::{subject_from_headers, JwtKeys};
 use axum::http::{header, HeaderMap};
 use crypto::{compute_signature, verify_signature, PayloadCipher};
@@ -250,4 +259,91 @@ fn database_vendor_is_not_named_in_source() {
             path.display(),
         );
     }
+}
+
+// --- Agent response handling ------------------------------------------------------
+//
+// The bodies below are the live endpoint's real output, recorded while wiring the
+// provider up. Both failure cases were observed, not imagined: the default model
+// reasons before it answers, and a tight token budget means it never gets as far as
+// answering. A parser that shrugs at that stores an empty string as the mediated
+// message, and the thing the user typed disappears with no error raised anywhere.
+
+/// Recorded with max_tokens=200. Note the 200 OK, the empty content, and the 200
+/// completion tokens spent entirely on reasoning.
+const TRUNCATED_BY_BUDGET: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"We need to rewrite the given message calmly."},"finish_reason":"length"}],"usage":{"prompt_tokens":105,"completion_tokens":200,"total_tokens":305,"completion_tokens_details":{"reasoning_tokens":200}}}"#;
+
+/// The same request with max_tokens=2000.
+const COMPLETED: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"I feel frustrated because I don't feel heard when I speak.","reasoning_content":"The original is an exaggeration; soften it."},"finish_reason":"stop"}],"usage":{"prompt_tokens":105,"completion_tokens":77,"total_tokens":182,"completion_tokens_details":{"reasoning_tokens":63}}}"#;
+
+#[test]
+fn budget_truncation_is_a_failure_not_a_partial_answer() {
+    assert!(
+        matches!(parse_completion(TRUNCATED_BY_BUDGET), Err(AiError::TokenBudgetExhausted)),
+        "a completion cut off mid-answer must not be delivered as a message",
+    );
+}
+
+/// The most important check here. Without it an empty mediated message reaches a real
+/// couple, and the sender is told their message was delivered.
+#[test]
+fn empty_content_is_never_treated_as_a_message() {
+    for body in [
+        r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[{"message":{"content":"   \n  "},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[{"message":{"role":"assistant"},"finish_reason":"stop"}]}"#,
+    ] {
+        assert!(
+            matches!(parse_completion(body), Err(AiError::EmptyContent)),
+            "empty completion accepted: {body}",
+        );
+    }
+}
+
+/// `reasoning_content` is the model's private working and can restate the raw vent
+/// verbatim. The product's central promise is that those words are never shown to
+/// anyone, so it must never be read as output — including as a fallback when
+/// `content` is missing.
+#[test]
+fn reasoning_content_never_becomes_output() {
+    let body = r#"{"choices":[{"message":{"content":"The delivered sentence.","reasoning_content":"They typed: you never listen to me, it is infuriating."},"finish_reason":"stop"}],"usage":{}}"#;
+
+    let completion = parse_completion(body).expect("valid completion");
+    assert_eq!(completion.content, "The delivered sentence.");
+    assert!(
+        !completion.content.contains("you never listen"),
+        "the model's private reasoning reached the output",
+    );
+
+    // And with no content at all, the reasoning must not be substituted for it.
+    let reasoning_only = r#"{"choices":[{"message":{"reasoning_content":"They typed something private."},"finish_reason":"stop"}]}"#;
+    assert!(matches!(parse_completion(reasoning_only), Err(AiError::EmptyContent)));
+}
+
+#[test]
+fn valid_completion_parses_with_its_token_counts() {
+    let completion = parse_completion(COMPLETED).expect("valid completion");
+    assert_eq!(completion.content, "I feel frustrated because I don't feel heard when I speak.");
+    assert_eq!(completion.input_tokens, 105);
+    // Includes the 63 reasoning tokens: billing-accurate, not answer length.
+    assert_eq!(completion.output_tokens, 77);
+}
+
+#[test]
+fn malformed_bodies_fail_closed() {
+    for body in ["", "not json", "{}", r#"{"choices":[]}"#] {
+        assert!(parse_completion(body).is_err(), "`{body}` was accepted");
+    }
+}
+
+/// Retrying a 4xx cannot succeed and spends provider quota a real user needs.
+#[test]
+fn only_transient_failures_are_retried() {
+    assert!(AiError::Upstream(500).is_retryable());
+    assert!(AiError::Upstream(429).is_retryable());
+    assert!(AiError::Transport("timed out".into()).is_retryable());
+
+    assert!(!AiError::Upstream(401).is_retryable());
+    assert!(!AiError::Upstream(400).is_retryable());
+    assert!(!AiError::NoConfig("tone_rewriter".into()).is_retryable());
 }

@@ -9,6 +9,9 @@
 
 use std::io::Read;
 
+// Path-imported because this crate is a binary, not a library. The tool uses only
+// `seal`, so the rest of the module reads as dead code from here.
+#[allow(dead_code)]
 #[path = "../crypto/mod.rs"]
 mod crypto;
 

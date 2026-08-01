@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -92,6 +93,8 @@ async fn main() {
         .expect("GATEWAY_PAYLOAD_KEY must be a base64-encoded 32-byte key");
     let vent_cipher = PayloadCipher::from_base64_key(&config.vent_encryption_key)
         .expect("VENT_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+    let provider_cipher = PayloadCipher::from_base64_key(&config.provider_key_sealing_key)
+        .expect("PROVIDER_KEY_SEALING_KEY must be a base64-encoded 32-byte key");
 
     // Transaction-mode poolers (PgBouncer, port 6543) hand each query a different
     // server connection, so server-side prepared statements collide across requests
@@ -127,10 +130,17 @@ async fn main() {
         .await
         .expect("Could not load identity-provider verification keys; every session would be rejected");
 
+    let orchestrator = MultiAgentOrchestrator::new(
+        http_client.clone(),
+        ai::AgentRegistry::new(provider_cipher),
+        main_db_pool.clone(),
+        sensitive_db_pool.clone(),
+    );
+
     let state = Arc::new(AppState {
         main_db_pool,
         sensitive_db_pool,
-        orchestrator: Arc::new(MultiAgentOrchestrator::new()),
+        orchestrator: Arc::new(orchestrator),
         gateway_cipher,
         vent_cipher,
         jwt_keys,
