@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod crypto;
+pub mod db;
 pub mod gateway;
 pub mod handlers;
 pub mod models;
@@ -114,6 +115,12 @@ async fn main() {
         .expect("Failed to connect to Isolated Postgres Cluster pool");
 
     tracing::info!("Successfully established connection pools to both PostgreSQL instances.");
+
+    // Before anything serves traffic. A backend answering requests against a schema
+    // it has not finished migrating is worse than one that refuses to start.
+    db::run(&main_db_pool, &sensitive_db_pool)
+        .await
+        .expect("Schema migrations failed; refusing to serve against an unknown schema");
 
     let http_client = reqwest::Client::new();
     let jwt_keys = auth::fetch_jwks(&http_client, &config.supabase_url)
