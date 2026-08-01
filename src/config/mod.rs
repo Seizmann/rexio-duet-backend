@@ -27,6 +27,9 @@ pub struct Config {
     pub gateway_payload_key: String,
     pub gateway_signing_key: String,
     pub vent_encryption_key: String,
+    /// Unseals `ai_providers.api_key_sealed`. The one piece of AI configuration that
+    /// cannot live in the database, because a key cannot decrypt itself.
+    pub provider_key_sealing_key: String,
     pub identity_url: String,
     pub identity_service_key: String,
     pub port: u16,
@@ -40,6 +43,7 @@ impl Config {
             gateway_payload_key: require("GATEWAY_PAYLOAD_KEY"),
             gateway_signing_key: require("GATEWAY_SIGNING_KEY"),
             vent_encryption_key: require("VENT_ENCRYPTION_KEY"),
+            provider_key_sealing_key: require("PROVIDER_KEY_SEALING_KEY"),
             // These two variable names still carry the vendor's name. They are CI and
             // VPS secrets, so renaming them breaks every deploy until each store is
             // updated by hand — not worth it for tidiness. The fields they populate

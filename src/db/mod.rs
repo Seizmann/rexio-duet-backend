@@ -27,6 +27,14 @@ const MAIN: &[Migration] = &[
         name: "0002_users_as_profile",
         sql: include_str!("../../migrations_main/0002_users_as_profile.sql"),
     },
+    Migration {
+        name: "0003_ai_providers",
+        sql: include_str!("../../migrations_main/0003_ai_providers.sql"),
+    },
+    Migration {
+        name: "0004_seed_agent_roster",
+        sql: include_str!("../../migrations_main/0004_seed_agent_roster.sql"),
+    },
 ];
 
 const SENSITIVE: &[Migration] = &[Migration {
